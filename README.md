@@ -10,17 +10,20 @@ A Python script for downloading YouTube Music albums and playlists with configur
 - Supports Opus downloads using yt-dlp format `251`
 - Supports `m4a`, `ogg`/`.opus`, and `webm` containers, with codec-specific defaults
 - Automatically detects whether the URL is an **album** or a **mixed playlist** and handles artwork accordingly
-  - **Albums** — fetches a single square artwork image and embeds it into every track
-  - **Playlists** — fetches per-track artwork individually, deduplicating where multiple tracks share the same album art
+  - **Albums** — fetches the album's own square artwork and embeds it into every track
+  - **Playlists** — resolves artwork per track in tiers (see [How artwork is chosen](#how-artwork-is-chosen))
 - Artwork is always sourced from square thumbnails, with configurable requested resolution (600×600px by default)
 - WebM output skips embedded artwork because the attached-artwork workflow is not supported
-- Embeds artwork directly into M4A and Ogg/Opus files using ffmpeg
+- Embeds artwork into M4A files (attached picture) and into Ogg/Opus files (`METADATA_BLOCK_PICTURE`)
 - Sets the `date` metadata field to the original release year (sourced from YouTube Music's `release_year` field, falling back to upload year)
 - Sets the `track_number` field from the playlist index
 - Clears the `genre` tag (YouTube Music only provides the useless generic value "Music")
 - Skips re-downloading files that already exist
 - Checks pre-existing files with ffprobe and re-embeds artwork if missing
 - Cleans up orphaned `.temp.m4a` files left by interrupted yt-dlp runs
+- Ctrl+C is handled cleanly: scratch artwork is removed and the exit code is 130
+- Never overwrites or deletes files it did not create (your own `cover.jpg` is left alone)
+- Validates every downloaded image before use, and never replaces an audio file with a failed embed
 - Uses yt-dlp's built-in retry mechanism for transient network failures
 - `--dry-run` mode to preview what would happen without downloading anything
 - `--log` option to save a full run log to disk
@@ -163,11 +166,30 @@ Python library used for coloured terminal output. It works on all three platform
 ```powershell
 python -m pip install -U colorama
 ```
-
 #### macOS / Linux
 
 ```bash
 python3 -m pip install -U colorama
+```
+
+### mutagen
+
+Required **only** for artwork embedding in Ogg/Opus (`.opus`) output. The Ogg
+container cannot carry an attached picture the way M4A does — ffmpeg rejects it
+outright — so the picture is written as a base64 `METADATA_BLOCK_PICTURE`
+Vorbis comment instead. M4A and WebM output do not need it. If it is missing,
+opus downloads still work and artwork is simply skipped with a warning.
+
+#### Windows
+
+```powershell
+python -m pip install -U mutagen
+```
+
+#### macOS / Linux
+
+```bash
+python3 -m pip install -U mutagen
 ```
 
 ### Deno
@@ -422,6 +444,7 @@ ytm-dlp --codec aac "https://music.youtube.com/playlist?list=OLAK5uy_..."
 |---|---:|---|
 | `size` | `600` | Requested square artwork size in pixels. YouTube Music natively serves up to 544px; larger requests may be server-side upscaled. |
 | `max_workers` | `8` | Maximum concurrent thumbnail downloads for playlists. |
+| `per_track` | `false` | `false` shares the playlist/album cover across tracks; `true` crops a distinct square from each track's largest video frame. See [How artwork is chosen](#how-artwork-is-chosen). |
 
 #### `[behavior]`
 
@@ -471,6 +494,7 @@ These apply to every job and must be placed **before** the first URL.
 | `--browser NAME` | `download.browser` | `firefox` | Browser used for YouTube cookies. |
 | `--size N` | `artwork.size` | `600` | Requested square artwork size in pixels. |
 | `--max-workers N` | `artwork.max_workers` | `8` | Concurrent playlist artwork downloads. |
+| `--per-track-art` | `artwork.per_track` | `false` | Crop a distinct square per track instead of sharing the playlist cover. |
 | `--retries N` | `download.retries` | `10` | Download retry count. |
 | `--dry-run` | — | off | Preview without downloading or modifying files. |
 | `--log [FILE]` | `behavior.log` | `off` | Write a log; without a filename, creates an automatic timestamped filename. |
@@ -500,7 +524,79 @@ The normal codec/quality mapping is:
 
 For Opus + Ogg, the native Opus stream is remuxed into an Ogg container; it is not re-encoded. Opus + WebM keeps the native delivery container and skips artwork embedding. Invalid codec/container combinations fall back to the codec's default container with a warning.
 
+Artwork is embedded differently per container:
+
+| Container | Method | Requires |
+|---|---|---|
+| `.m4a` | ffmpeg attached picture | ffmpeg |
+| `.opus` (Ogg) | `METADATA_BLOCK_PICTURE` Vorbis comment | mutagen |
+| `.webm` | not supported — artwork is skipped | — |
+
 When `--format` or `format_override` is used, the codec/quality mapping is bypassed.
+
+### Output filenames
+
+Playlist entries are zero-padded so they sort numerically:
+
+```
+03 - Song Title.m4a      # playlist entry 3
+Song Title.m4a          # a bare video URL (no playlist index)
+```
+
+> **Note:** earlier versions used `3 Song Title.m4a`, and a bare video URL
+> produced `NA Song Title.m4a`. If you already have a library built with the
+> old names, those files will be downloaded again under the new names.
+
+### How artwork is chosen
+
+YouTube Music does something worth knowing: **it publishes square artwork for
+the album/playlist, but not for individual tracks.** A track's own thumbnail
+list is entirely 16:9 (typically 42 sizes up to 1920×1080), and yt-dlp exposes
+no square variant — so "fetch the square thumbnail for this track" is not
+possible; the data is not there.
+
+Artwork is therefore resolved in tiers:
+
+1. **The track's own square thumbnail**, when the source provides one (other
+   extractors do).
+2. **The playlist/album cover**, shared by every track. This is the normal
+   YouTube Music path, and why an album download gets the real cover art.
+3. **A distinct square per track**, cropped from that track's largest video
+   frame — opt-in via `--per-track-art` / `per_track = true`.
+
+Tier 3 exists for mixed playlists, where one shared cover tells you nothing
+about which track is which. The trade-off: it is a video still, not real cover
+art. Enable it per run or in the config file:
+
+```powershell
+ytm-dlp URL --dir "Mixed Playlist" --per-track-art
+```
+
+```toml
+[artwork]
+per_track = true
+```
+
+YouTube also advertises thumbnail sizes that do not exist — an album's
+1200×1200 `maxresdefault` entry carries no signature and returns 404 — so
+candidates are always tried largest-first and it falls through to the next one
+(640×640 in practice). `--size` is therefore a request, not a guarantee: album
+art arrives at YouTube's native resolution.
+
+### `--format` and the output container
+
+`--format` bypasses the codec/quality mapping, so the container can no longer be
+derived from it. ytm-dlp infers the container from the format id instead
+(`140`/`141` → m4a, `249`/`250`/`251` → webm, and so on):
+
+```powershell
+ytm-dlp URL --format 251          # container inferred as webm, artwork skipped
+ytm-dlp URL --format 140          # container inferred as m4a, artwork embedded
+ytm-dlp URL --format bestaudio    # unknown -> warns; pass --container to match
+```
+
+If the prediction is wrong, the run detects the real extension after
+downloading and adapts rather than reporting an empty result.
 
 ---
 

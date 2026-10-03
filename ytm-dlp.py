@@ -19,6 +19,10 @@ Single-job usage:
 Multi-disc usage:
   ytm-dlp URL --dir "Artist/Album" --cd "CD1:1-17" --cd "CD2:18-30"
 
+Output filenames:
+  03 - Song Title.m4a      (playlist entries, zero-padded)
+  Song Title.m4a          (a bare video URL)
+
 Global flags (before first URL, apply to all jobs — all overridable via
 config file, see --init-config):
   --format code       Raw yt-dlp format override (advanced; bypasses codec/quality)
@@ -28,6 +32,8 @@ config file, see --init-config):
   --browser NAME       Browser to pull cookies from (default: firefox)
   --size N             Artwork resolution px (default: 600)
   --max-workers N       Concurrent thumbnail downloads (default: 8)
+  --per-track-art       Crop a distinct square per track instead of sharing
+                        the playlist cover (useful for mixed playlists)
   --retries N          Download retry count (default: 10)
   --dry-run            Preview without downloading
   --log [FILE]         Write log file
@@ -35,14 +41,19 @@ config file, see --init-config):
 """
 
 import argparse
+import base64
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +62,16 @@ from typing import Optional
 
 import yt_dlp
 from colorama import Fore, Style, init as colorama_init
-import time
+
+# Optional: only needed to embed artwork into Ogg/Opus, where the Ogg muxer
+# cannot carry an attached picture (ffmpeg rejects it outright). When mutagen
+# is unavailable we degrade gracefully to skipping artwork for those files.
+try:
+    from mutagen.flac import Picture
+    from mutagen.oggopus import OggOpus
+    HAVE_MUTAGEN = True
+except ImportError:
+    HAVE_MUTAGEN = False
 
 try:
     import tomllib
@@ -160,13 +180,18 @@ quality = "premium"
 # Container override. Leave as "" to use the default container for the
 # chosen codec:
 #   aac  -> m4a   (.m4a)
-#   opus -> ogg   (.opus — Opus audio in an Ogg container; this is the
-#                  standard extension for Ogg-Opus files)
+#   opus -> ogg   (.opus — Opus audio in an Ogg container)
 #
 # For opus you may explicitly set "webm" instead of "ogg" to keep
 # YouTube's native delivery container with no remuxing step.
 # NOTE: cover art embedding is NOT supported for webm and will be
 # automatically skipped if this is selected.
+#
+# Artwork for ogg/.opus files is stored as a METADATA_BLOCK_PICTURE
+# Vorbis comment (written by mutagen), because the Ogg container cannot
+# carry an attached picture the way M4A does. Install mutagen to enable
+# it:  pip install mutagen
+# Without mutagen, opus downloads still work but artwork is skipped.
 container = ""
 
 # Advanced: raw yt-dlp format code, e.g. "251". When set, this completely
@@ -184,6 +209,16 @@ size = 600
 
 # Max concurrent thumbnail downloads when fetching artwork for a playlist.
 max_workers = 8
+
+# How artwork is chosen for tracks that have no square thumbnail of their own
+# (which is every YouTube Music track — YouTube only publishes square art for
+# the album/playlist itself).
+#   false = share the playlist/album cover across all tracks
+#   true  = crop a distinct square out of each track's largest video frame.
+#           Useful for mixed playlists, where one shared cover tells you
+#           nothing about which track is which, but note the result is a video
+#           still rather than real cover art.
+per_track = false
 
 [behavior]
 # Default log behavior: "off", "auto" (timestamped filename), or a fixed
@@ -250,6 +285,46 @@ VALID_CONTAINERS_FOR_CODEC = {"aac": {"m4a"}, "opus": {"ogg", "webm"}}
 # Container -> actual file extension yt-dlp/ffmpeg will produce
 CONTAINER_EXT = {"m4a": "m4a", "ogg": "opus", "webm": "webm"}
 
+# How artwork gets embedded, keyed by the final file extension:
+#   ffmpeg  - MP4/M4A carries an attached_pic video stream (verified working)
+#   mutagen - Ogg/Opus cannot hold an mjpeg stream at all, so the picture has
+#             to go into a METADATA_BLOCK_PICTURE Vorbis comment instead
+#   skip    - WebM/Opus delivery containers are not supported
+ARTWORK_BACKEND = {"m4a": "ffmpeg", "opus": "mutagen", "webm": "skip"}
+
+# `--format` bypasses the codec/quality mapping, so the output container can no
+# longer be inferred from codec/quality — it has to come from the format id.
+# Without this, `--format 251` (Opus/WebM) still searched for *.m4a, matched
+# nothing, and reported "All files already have artwork — nothing to mux".
+FORMAT_ID_CONTAINER = {
+    "139": "m4a",    # AAC ~48k
+    "140": "m4a",    # AAC ~128k
+    "141": "m4a",    # AAC ~256k
+    "256": "m4a",    # AAC ~5k
+    "258": "m4a",    # AAC ~384k
+    "249": "webm",   # Opus ~50k
+    "250": "webm",   # Opus ~70k
+    "251": "webm",   # Opus ~160k
+    "338": "webm",   # Opus ~480k
+}
+# Extensions we are willing to adopt if the predicted one turns out wrong.
+AUDIO_EXTS = ("m4a", "opus", "ogg", "webm", "mp3", "mka")
+
+
+def infer_container_from_format(fmt: str) -> str | None:
+    """
+    Best-effort container for a raw yt-dlp format selector.
+
+    Handles compound selectors ("140/best", "251,140") by taking the first
+    concrete numeric id it recognises. Returns None when the selector carries
+    no id we know, in which case the caller must warn rather than guess.
+    """
+    for token in re.findall(r'\b(\d{2,4})\b', fmt or ""):
+        container = FORMAT_ID_CONTAINER.get(token)
+        if container:
+            return container
+    return None
+
 
 def resolve_download_profile(
     codec: str, quality: str,
@@ -258,17 +333,41 @@ def resolve_download_profile(
 ) -> tuple[str, str, str, str, bool]:
     """
     Returns (yt_dlp_format_code, codec, container, final_ext, skip_artwork).
+
+    skip_artwork reflects ARTWORK_BACKEND: WebM has no supported embed path,
+    while Ogg/Opus is handled through mutagen rather than ffmpeg.
     """
     codec   = (codec or "aac").lower()
     quality = (quality or "premium").lower()
 
     if format_override:
-        container = (container_override or "m4a").lower()
-        if container not in CONTAINER_EXT:
-            print_warn(f"Unknown container '{container}', defaulting to m4a.")
+        inferred = infer_container_from_format(format_override)
+        if container_override:
+            container = container_override.lower()
+            if container not in CONTAINER_EXT:
+                print_warn(f"Unknown container '{container}', defaulting to m4a.")
+                container = "m4a"
+            if inferred and inferred != container:
+                print_warn(
+                    f"--format {format_override} normally delivers "
+                    f"'{inferred}' but --container '{container}' was given — "
+                    f"trusting --container."
+                )
+        elif inferred:
+            container = inferred
+            print_info(
+                f"--format {format_override} implies container "
+                f"'{container}' (codec/quality ignored)."
+            )
+        else:
             container = "m4a"
+            print_warn(
+                f"Could not infer a container from --format {format_override!r}. "
+                f"Assuming m4a — pass --container to match the real output, or "
+                f"artwork/globbing may not find the downloaded files."
+            )
         final_ext = CONTAINER_EXT[container]
-        skip_artwork = (final_ext == "webm")
+        skip_artwork = (ARTWORK_BACKEND.get(final_ext) == "skip")
         return format_override, codec, container, final_ext, skip_artwork
 
     fmt = CODEC_FORMAT_MAP.get((codec, quality))
@@ -288,7 +387,7 @@ def resolve_download_profile(
         container = CODEC_DEFAULT_CONTAINER[codec]
 
     final_ext    = CONTAINER_EXT[container]
-    skip_artwork = (final_ext == "webm")
+    skip_artwork = (ARTWORK_BACKEND.get(final_ext) == "skip")
     return fmt, codec, container, final_ext, skip_artwork
 
 
@@ -328,10 +427,32 @@ def parse_args() -> tuple[argparse.Namespace, list[Job]]:
     global_parser.add_argument("--max-workers", type=int, default=None, dest="max_workers")
     global_parser.add_argument("--retries", type=int, default=None)
     global_parser.add_argument("--dry-run", action="store_true")
+    global_parser.add_argument(
+        "--per-track-art", action="store_true", default=None, dest="per_track_art",
+        help="Crop a distinct square from each track instead of sharing the playlist cover",
+    )
     global_parser.add_argument("--log",     metavar="FILE", nargs="?",
                                const="auto", default=None)
 
     global_ns, remaining = global_parser.parse_known_args()
+
+    # The global parser has add_help=False, so -h/--help lands in `remaining`
+    # and used to be handed to the per-job parser, which errored out with the
+    # "[job]" usage instead of the real one.
+    if any(a in ("-h", "--help") for a in remaining):
+        global_parser.print_help()
+        print(
+            "\nPer-job options:\n"
+            "  url                 YouTube Music album/playlist/video URL\n"
+            "  --dir PATH          Output directory (relative or absolute)\n"
+            "  --ts SPEC           Track selection, e.g. 1-5,8,12-14\n"
+            "  --cd FOLDER:SPEC    Multi-disc; repeatable, e.g. --cd CD1:1-17\n"
+            "\nExamples:\n"
+            '  ytm-dlp URL --dir "Artist/Album"\n'
+            '  ytm-dlp URL1 --dir "Artist/Album1", URL2 --dir "Artist/Album2"\n'
+            '  ytm-dlp URL --dir "Artist/Album" --cd "CD1:1-17" --cd "CD2:18-30"\n'
+        )
+        sys.exit(0)
 
     # --- Split remaining into per-job segments at URL boundaries ---
     segments: list[list[str]] = []
@@ -367,7 +488,14 @@ def parse_args() -> tuple[argparse.Namespace, list[Job]]:
 
         ts: Optional[set[int]] = None
         if ns.ts:
-            ts = parse_track_selection(ns.ts)
+            try:
+                ts = parse_track_selection(ns.ts)
+            except ValueError as e:
+                print(f"Error in --ts spec '{ns.ts}': {e}")
+                sys.exit(1)
+            if not ts:
+                print(f"Error: --ts spec '{ns.ts}' selected no tracks.")
+                sys.exit(1)
 
         cd_specs: list[tuple[str, set[int]]] = []
         if ns.cd:
@@ -415,12 +543,36 @@ def sanitize_folder_name(name: str) -> str:
     return sanitized
 
 
+def ask(prompt: str) -> str | None:
+    """
+    Prompt the user, returning None when there is no interactive terminal
+    (piped input, CI, a scheduler). Callers treat None as "cancel" instead of
+    letting EOFError escape as a traceback.
+    """
+    try:
+        return input(prompt).strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
 def resolve_directory(dir_spec: str, dry_run: bool) -> Path | None:
-    parts   = Path(dir_spec.replace("\\", os.sep)).parts
-    current = Path.cwd()
+    spec = Path(dir_spec.replace("\\", os.sep))
+    # An absolute spec must not have its anchor sanitised: 'C:\' would become
+    # 'C' and the run would try to create ./C/... instead of using the drive.
+    if spec.drive or spec.root:
+        current = Path(spec.anchor)
+        parts   = spec.parts[1:]
+    else:
+        current = Path.cwd()
+        parts   = spec.parts
 
     for raw_part in parts:
-        part = sanitize_folder_name(raw_part)
+        # '.' and '..' are legitimate path segments, not illegal characters.
+        # Letting rstrip('. ') through used to silently drop them, which
+        # resolved --dir "..\Album" to the current directory instead.
+        part = raw_part if raw_part in (os.curdir, os.pardir) \
+            else sanitize_folder_name(raw_part)
         if part != raw_part:
             print_warn(
                 f"Folder name contained illegal characters and was adjusted: "
@@ -440,12 +592,15 @@ def resolve_directory(dir_spec: str, dry_run: bool) -> Path | None:
 
         print_warn(f"Directory does not exist: {target}")
         while True:
-            raw = input(
+            raw = ask(
                 f"  Create {Fore.CYAN}'{part}'{Style.RESET_ALL}? "
                 f"[{Fore.GREEN}Y{Style.RESET_ALL}es / "
                 f"{Fore.RED}N{Style.RESET_ALL}o / "
                 f"{Fore.YELLOW}M{Style.RESET_ALL}odify name] "
-            ).strip().upper()
+            )
+            if raw is None:
+                print_warn("No interactive terminal available — cannot create directories.")
+                return None
 
             if raw == "Y":
                 if not dry_run:
@@ -461,7 +616,12 @@ def resolve_directory(dir_spec: str, dry_run: bool) -> Path | None:
                 return None
 
             elif raw == "M":
-                new_name = input(f"  Enter new name for '{part}': ").strip()
+                try:
+                    new_name = input(f"  Enter new name for '{part}': ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    print_warn("No interactive terminal available — cannot rename.")
+                    return None
                 if not new_name:
                     print_warn("  No name entered — try again.")
                     continue
@@ -522,16 +682,30 @@ def parse_cd_spec(spec: str) -> tuple[str, set[int]]:
 # ---------------------------------------------------------------------------
 
 def parse_track_selection(spec: str) -> set[int]:
+    """
+    Parse "1-5,8,12-14" into a set of track numbers.
+
+    Raises ValueError with a readable message rather than letting int() raise
+    a bare "invalid literal for int()" traceback.
+    """
     result: set[int] = set()
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            result.update(range(int(lo.strip()), int(hi.strip()) + 1))
-        else:
-            result.add(int(part))
+        bounds = part.split("-")
+        if len(bounds) > 2:
+            raise ValueError(f"invalid range '{part}' (expected 'lo-hi')")
+        try:
+            if len(bounds) == 2:
+                lo, hi = int(bounds[0].strip()), int(bounds[1].strip())
+                if hi < lo:
+                    raise ValueError(f"range '{part}' ends before it starts")
+                result.update(range(lo, hi + 1))
+            else:
+                result.add(int(part))
+        except ValueError as e:
+            raise ValueError(f"'{part}' is not a valid track number or range") from e
     return result
 
 
@@ -539,60 +713,262 @@ def is_album_url(url: str) -> bool:
     return bool(re.search(r'browse/MPRE|playlist\?list=OLAK5uy_', url))
 
 
-def best_square_thumbnail(thumbnails: list, size: int = 600) -> str | None:
+def square_thumbnail_candidates(thumbnails: list, size: int = 600) -> list[str]:
+    """
+    Every square thumbnail URL, largest first.
+
+    YouTube regularly advertises a resolution that does not exist — an album's
+    1200x1200 "maxresdefault" entry carries no signature and 404s — so callers
+    must try these in order instead of trusting the largest one.
+    """
     square = [
-        t for t in thumbnails
-        if t.get("width") and t.get("height") and t["width"] == t["height"]
+        t for t in (thumbnails or [])
+        if t.get("url") and t.get("width") and t.get("height")
+        and t["width"] == t["height"]
     ]
-    if not square:
+    square.sort(key=lambda t: t["width"], reverse=True)
+    return [re.sub(r'w\d+-h\d+', f'w{size}-h{size}', t["url"]) for t in square]
+
+
+def best_square_thumbnail(thumbnails: list, size: int = 600) -> str | None:
+    candidates = square_thumbnail_candidates(thumbnails, size)
+    return candidates[0] if candidates else None
+
+
+def widest_thumbnail_url(thumbnails: list) -> str | None:
+    """
+    Largest thumbnail of any aspect ratio.
+
+    Individual YouTube tracks expose no square artwork at all (yt-dlp has no
+    musicVideoThumbnailRenderer handling), so this is what per-track artwork
+    gets centre-cropped from.
+    """
+    usable = [t for t in (thumbnails or []) if t.get("url") and t.get("width")]
+    if not usable:
         return None
-    best = max(square, key=lambda t: t["width"])
-    return re.sub(r'w\d+-h\d+', f'w{size}-h{size}', best["url"])
+    return max(usable, key=lambda t: t["width"])["url"]
 
 
-def download_image(url: str, dest: Path) -> bool:
+def sniff_image_mime(path: Path) -> str | None:
+    """
+    Identify a downloaded file by its magic bytes.
+
+    Servers happily return an HTML error/captcha page with HTTP 200, and a
+    connection dropped mid-transfer leaves a truncated file behind. Either one
+    used to reach ffmpeg, which then failed *after* creating its output file —
+    and the old code replaced the audio with that broken output. Rejecting
+    non-images here removes the trigger entirely.
+    """
     try:
-        urllib.request.urlretrieve(url, dest)
-        return dest.exists()
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return None
+    if head.startswith(b'\xff\xd8\xff'):
+        return "image/jpeg"
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return "image/png"
+    if head.startswith((b'GIF87a', b'GIF89a')):
+        return "image/gif"
+    if head.startswith(b'RIFF') and head[8:12] == b'WEBP':
+        return "image/webp"
+    return None
+
+
+def image_dimensions(data: bytes) -> tuple[int, int]:
+    """
+    Minimal JPEG SOF / PNG IHDR dimension probe so METADATA_BLOCK_PICTURE
+    carries real pixel dimensions. Avoids a Pillow dependency just to read
+    four integers.
+    """
+    if data.startswith(b'\x89PNG\r\n\x1a\n') and len(data) >= 24:
+        width  = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        return width, height
+    if not data.startswith(b'\xff\xd8'):
+        return 0, 0
+    sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+           0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    i, n = 2, len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        if marker in sof:
+            height = int.from_bytes(data[i + 5:i + 7], "big")
+            width  = int.from_bytes(data[i + 7:i + 9], "big")
+            return width, height
+        i += 2 + seg_len
+    return 0, 0
+
+
+def download_image(url: str, dest: Path, timeout: int = 20) -> bool:
+    """
+    Download a thumbnail, validating it is a real, complete image.
+
+    Uses urlopen with an explicit timeout rather than urlretrieve, which offers
+    no portable way to bound the transfer and could block indefinitely on a
+    stalled connection.
+    """
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ytm-dlp/1.0",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if getattr(response, "status", 200) != 200:
+                print_warn(f"Image request returned HTTP {response.status}")
+                return False
+            with open(dest, "wb") as fh:
+                shutil.copyfileobj(response, fh, 64 * 1024)
     except Exception as e:
         print_warn(f"Could not download image: {e}")
+        dest.unlink(missing_ok=True)          # never leave a partial file behind
         return False
+
+    mime = sniff_image_mime(dest)
+    if mime is None:
+        print_warn(f"Discarding non-image response from {url}")
+        dest.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def download_first_available(urls: list[str], dest: Path) -> str | None:
+    """
+    Try each URL in order and return the first that yields a usable image.
+
+    Confirms the file really landed, not just that the fetch reported success.
+    """
+    for url in urls:
+        if download_image(url, dest) and dest.exists() and dest.stat().st_size > 0:
+            return url
+        dest.unlink(missing_ok=True)
+    return None
+
+
+def crop_to_square(src: Path, dest: Path, size: int) -> bool:
+    """
+    Centre-crop a thumbnail to a square and scale it, overwriting dest.
+
+    This is how per-track artwork is produced: YouTube exposes no square
+    thumbnail for an individual track, so its largest available frame is
+    cropped instead. Uses the same verify-before-replace discipline as
+    mux_artwork so a failed crop can never clobber a good file.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=dest.suffix)
+    os.close(fd)
+    temp = Path(tmp_name)
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-vf", f"crop='min(iw,ih)':'min(iw,ih)',scale={size}:{size}",
+             "-frames:v", "1", "-q:v", "2",
+             str(temp), "-hide_banner", "-loglevel", "error"],
+            capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            print_warn(f"Could not crop artwork: "
+                       f"{detail[-1] if detail else f'exit {proc.returncode}'}")
+            return False
+        if not temp.exists() or temp.stat().st_size == 0:
+            return False
+        if sniff_image_mime(temp) is None:
+            print_warn("Crop produced an unreadable image — keeping original.")
+            return False
+        temp.replace(dest)
+        return True
+    except Exception as e:
+        print_warn(f"ffmpeg exception while cropping artwork: {e}")
+        return False
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def probe_file_metadata(path: Path) -> dict:
     """
     Single ffprobe call returning everything needed for artwork matching:
-    the embedded title, comment/purl (source URL) tags, and whether a
-    video (artwork) stream is already attached. Works uniformly across
-    containers (m4a, opus/ogg).
+    the embedded title, comment/purl (source URL) tags, and whether an
+    artwork stream is already attached.
+
+    Tag location differs by container, which is why this reads both levels:
+      * MP4/M4A exposes them under format.tags
+      * Ogg/Opus exposes Vorbis comments under the *audio* stream's tags
+        (format.tags is empty there)
+      * an attached picture shows up as a video stream for both
+
+    Only audio-stream tags are merged: an attached picture carries its own
+    `comment` ("Cover (front)") that would otherwise shadow the real URL.
     """
     default = {"title": None, "comment": None, "purl": None, "has_artwork": False}
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error",
-             "-show_entries", "format_tags=title,comment,purl:stream=codec_type",
+             "-show_entries",
+             "format_tags=title,comment,purl:"
+             "stream_tags=title,comment,purl:"
+             "stream=codec_type",
              "-of", "json",
              str(path)],
             capture_output=True, text=True
         )
         data    = json.loads(result.stdout or "{}")
-        tags    = (data.get("format") or {}).get("tags") or {}
         streams = data.get("streams") or []
-        has_artwork = any(s.get("codec_type") == "video" for s in streams)
+
+        tags: dict[str, str] = {}
+        for key, val in ((data.get("format") or {}).get("tags") or {}).items():
+            tags[str(key).lower()] = val
+        for s in streams:
+            if s.get("codec_type") != "audio":
+                continue
+            for key, val in (s.get("tags") or {}).items():
+                tags.setdefault(str(key).lower(), val)
+
         return {
             "title":       tags.get("title"),
             "comment":     tags.get("comment"),
             "purl":        tags.get("purl"),
-            "has_artwork": has_artwork,
+            "has_artwork": any(s.get("codec_type") == "video" for s in streams),
         }
     except Exception:
         return default
 
 
-def mux_artwork(audio: Path, image: Path, index: int, ext: str) -> bool:
-    temp = Path(f"temp_mux_{index}.{ext}")
+def _verify_muxed_output(path: Path, original: Path) -> bool:
+    """
+    Confirm the muxed file is playable before it replaces the original.
+    Guards against ffmpeg exiting non-zero yet still leaving an output file
+    behind (it does exactly that when the input image is undecodable).
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return False
     try:
-        subprocess.run(
+        orig_size = original.stat().st_size
+        # A successful tag/stream copy must not shrink the audio noticeably.
+        if orig_size and path.stat().st_size < orig_size * 0.9:
+            return False
+    except OSError:
+        return False
+    return probe_file_metadata(path)["has_artwork"]
+
+
+def mux_artwork(audio: Path, image: Path, ext: str) -> bool:
+    """Attach artwork to an MP4/M4A file using an attached_pic video stream."""
+    # NOTE: tempfile.NamedTemporaryFile(delete=True) cannot be used here — on
+    # Windows it opens the file with an exclusive delete-on-close handle, so
+    # ffmpeg cannot open it for writing. mkstemp + close gives us a unique,
+    # unlocked, same-directory path instead.
+    fd, tmp_name = tempfile.mkstemp(dir=str(audio.parent), suffix=f".{ext}")
+    os.close(fd)
+    temp = Path(tmp_name)
+    try:
+        proc = subprocess.run(
             ["ffmpeg", "-y",
              "-i", str(audio), "-i", str(image),
              "-map", "0", "-map", "1",
@@ -600,22 +976,89 @@ def mux_artwork(audio: Path, image: Path, index: int, ext: str) -> bool:
              str(temp), "-hide_banner", "-loglevel", "error"],
             capture_output=True, text=True
         )
-        if temp.exists():
-            temp.replace(audio)
-            return True
-        return False
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            print_warn(
+                f"ffmpeg refused to attach artwork: "
+                f"{detail[-1] if detail else f'exit {proc.returncode}'}"
+            )
+            return False
+        if not _verify_muxed_output(temp, audio):
+            print_warn("ffmpeg produced an unusable output — keeping original file.")
+            return False
+        temp.replace(audio)
+        return True
     except Exception as e:
         print_warn(f"ffmpeg exception: {e}")
         return False
     finally:
-        if temp.exists():
-            temp.unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
+
+
+def embed_artwork_ogg(audio: Path, image: Path) -> bool:
+    """
+    Attach artwork to an Ogg/Opus file.
+
+    The Ogg muxer cannot carry an mjpeg stream — ffmpeg aborts with
+    "Unsupported codec id in stream 1". The interoperable way to carry a
+    picture in Ogg is a base64 METADATA_BLOCK_PICTURE Vorbis comment, which
+    mutagen writes in place. ffprobe still reports that picture as a video
+    stream, so has_artwork detection keeps working unchanged.
+    """
+    try:
+        data = image.read_bytes()
+        pic  = Picture()
+        pic.type = 3                                   # front cover
+        pic.mime = sniff_image_mime(image) or "image/jpeg"
+        pic.data = data
+        width, height = image_dimensions(data)
+        pic.width, pic.height = width, height
+        pic.depth = 24
+
+        audio_file = OggOpus(str(audio))
+        audio_file["METADATA_BLOCK_PICTURE"] = base64.b64encode(pic.write()).decode("ascii")
+        audio_file.save()
+    except Exception as e:
+        print_warn(f"Could not embed artwork: {e}")
+        return False
+
+    # Re-read to confirm the picture actually landed.
+    try:
+        pics = OggOpus(str(audio)).get("METADATA_BLOCK_PICTURE") or []
+        if not pics:
+            print_warn("Artwork tag did not persist — keeping original file.")
+            return False
+    except Exception as e:
+        print_warn(f"Could not verify embedded artwork: {e}")
+        return False
+    return True
+
+
+def embed_artwork(audio: Path, image: Path, backend: str, ext: str) -> bool:
+    # Validate here too, not just at download time: mutagen will happily store
+    # arbitrary bytes as a "picture", so an unvalidated file would embed an
+    # HTML error page as cover art and still report success.
+    if sniff_image_mime(image) is None:
+        print_warn(f"{image.name} is not a readable image — skipping artwork.")
+        return False
+    # `-map 0 -map 1` against a file that already carries an attached picture
+    # would add a *second* video stream, so never embed twice.
+    if probe_file_metadata(audio)["has_artwork"]:
+        return True
+    if backend == "ffmpeg":
+        return mux_artwork(audio, image, ext)
+    if backend == "mutagen":
+        return embed_artwork_ogg(audio, image)
+    return False
 
 
 def cleanup_yt_dlp_temps(directory: Path, ext: str):
     for f in directory.glob(f"*.temp.{ext}"):
-        f.unlink()
-        print_temp(f"Removed leftover temp file: {f.name}")
+        try:
+            f.unlink()
+            print_temp(f"Removed leftover temp file: {f.name}")
+        except OSError as e:
+            print_warn(f"Could not remove {f.name}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -626,21 +1069,14 @@ def build_ydl_opts(fmt: str, codec: str, container: str, browser: str,
                    retries: int, dry_run: bool,
                    track_selection: set[int] | None = None,
                    output_dir: Path | None = None) -> dict:
-    outtmpl = "%(playlist_index)s %(title)s.%(ext)s"
+    # "03 - Title.m4a" for playlist entries, plain "Title.m4a" for a bare
+    # video URL (playlist_index is absent there, which used to yield the
+    # literal "NA Title.m4a"). Zero-padding also makes name sorting numeric.
+    outtmpl = "%(playlist_index&{:02d} - |)s%(title)s.%(ext)s"
     if output_dir:
-        outtmpl = str(output_dir / "%(playlist_index)s %(title)s.%(ext)s")
+        outtmpl = str(output_dir / outtmpl)
 
-    postprocessors = [
-        {
-            "key": "MetadataFromField",
-            "formats": [
-                "%(playlist_index)s:%(track_number)s",
-                "%(release_year|upload_date>%Y)s:(?P<meta_date>.*)",
-                ":(?P<meta_genre>.*)",
-            ],
-            "when": "pre_process",
-        },
-    ]
+    postprocessors = []
 
     if codec == "opus" and container == "ogg":
         # Source is already Opus (webm delivery) — this is a fast remux to
@@ -690,8 +1126,16 @@ def fetch_thumbnails_for_track(url: str, browser: str, playlist_item: str = "1")
     return []
 
 
-def fetch_playlist_metadata(url: str, browser: str) -> list[dict]:
+def fetch_playlist_metadata(url: str, browser: str) -> tuple[list[dict], list]:
+    """
+    Return (entries, playlist_thumbnails).
+
+    playlist_thumbnails matters: YouTube Music puts the square artwork on the
+    playlist/album itself (up to 1200x1200) and gives individual tracks none at
+    all, so it is the only source of square art for a YT Music playlist.
+    """
     entries: list[dict] = []
+    playlist_thumbnails: list = []
     opts = {
         "cookiesfrombrowser": (browser,),
         "quiet": True, "no_warnings": True,
@@ -701,7 +1145,8 @@ def fetch_playlist_metadata(url: str, browser: str) -> list[dict]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                return entries
+                return entries, playlist_thumbnails
+            playlist_thumbnails = info.get("thumbnails") or []
             raw   = info.get("entries") or [info]
             total = len(raw)
             for i, e in enumerate(raw, start=1):
@@ -721,7 +1166,7 @@ def fetch_playlist_metadata(url: str, browser: str) -> list[dict]:
     except Exception as ex:
         print()
         print_warn(f"Metadata fetch error: {ex}")
-    return entries
+    return entries, playlist_thumbnails
 
 
 # ---------------------------------------------------------------------------
@@ -734,15 +1179,41 @@ def fetch_album_artwork(url: str, size: int, dry_run: bool,
     if dry_run:
         print_dry("Would fetch album artwork.")
         return None
-    thumbs  = fetch_thumbnails_for_track(url, browser, playlist_item="1")
-    img_url = best_square_thumbnail(thumbs, size)
-    if not img_url:
+
+    # Prefer the album's own artwork; fall back to the first track, whose
+    # thumbnail is not always the album cover.
+    candidates: list[str] = []
+    try:
+        with yt_dlp.YoutubeDL({
+            "cookiesfrombrowser": (browser,),
+            "quiet": True, "no_warnings": True,
+            "skip_download": True, "simulate": True, "ignoreerrors": True,
+            "playlist_items": "1",
+        }) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info:
+            candidates = square_thumbnail_candidates(info.get("thumbnails") or [], size)
+            if not candidates:
+                candidates = square_thumbnail_candidates(
+                    fetch_thumbnails_for_track(url, browser, playlist_item="1"), size
+                )
+    except Exception as e:
+        print_warn(f"Could not fetch album artwork: {e}")
+
+    if not candidates:
         print_warn("No square thumbnail found, artwork will be skipped.")
         return None
-    cover = output_dir / "cover.jpg"
-    if download_image(img_url, cover):
-        print_success("Square artwork saved.")
-        return cover
+
+    # Deliberately NOT "cover.jpg": that is a conventional file in an album
+    # folder, and this script overwrote and then deleted it. Use a hidden,
+    # content-addressed name so a user's own cover.jpg is never touched.
+    for url in candidates:
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+        cover = output_dir / f".ytm-cover_{digest}.jpg"
+        if download_image(url, cover):
+            print_success("Square artwork saved.")
+            return cover
+    print_warn("Could not download album artwork — it will be skipped.")
     return None
 
 
@@ -752,22 +1223,32 @@ def fetch_playlist_artwork(
     output_dir: Path,
     browser: str,
     max_workers: int = 8,
+    per_track: bool = False,
 ) -> tuple[dict[str, Path], dict[str, Path], set[Path]]:
     """
     Downloads artwork for each track in the playlist, in parallel.
+
+    Artwork is resolved per track in tiers, because YouTube Music exposes no
+    square thumbnail on individual tracks at all:
+
+      1. the track's own square thumbnail, when the source provides one
+      2. the playlist/album's square artwork (the normal YT Music path)
+      3. with per_track=True, the track's largest frame centre-cropped to a
+         square — distinct per track, but a video still rather than real cover
+         art; used for mixed playlists where one shared cover is unhelpful
 
     Returns:
       by_url:         webpage_url -> thumbnail Path  (primary lookup key)
       by_title:       title       -> thumbnail Path  (fallback lookup key)
       all_thumbnails: every downloaded thumbnail Path (used for cleanup)
     """
-    print_info("Playlist detected — fetching per-track square artwork...")
+    print_info("Playlist detected — fetching square artwork...")
     by_url:   dict[str, Path] = {}
     by_title: dict[str, Path] = {}
     all_thumbnails: set[Path] = set()
 
     print_info("Retrieving playlist metadata...")
-    entries = fetch_playlist_metadata(url, browser)
+    entries, playlist_thumbnails = fetch_playlist_metadata(url, browser)
     if not entries:
         print_warn("Could not retrieve playlist metadata.")
         return by_url, by_title, all_thumbnails
@@ -777,15 +1258,56 @@ def fetch_playlist_artwork(
 
     print_info(f"Found {len(entries)} track(s). Fetching artwork...")
 
+    own_square = sum(1 for e in entries
+                     if square_thumbnail_candidates(e["thumbnails"], size))
+    if not own_square:
+        print_info(
+            "No track exposes its own square artwork — "
+            + ("cropping each track's largest frame instead."
+               if per_track else "using the playlist cover for every track.")
+        )
+
     if dry_run:
+        cover_candidates = square_thumbnail_candidates(playlist_thumbnails, size)
         for entry in entries:
             display = f"{entry['index']} {entry['title']}"
-            img_url = best_square_thumbnail(entry["thumbnails"], size)
-            if not img_url:
-                print_warn(f"No square thumbnail for: {display}")
-            else:
+            if square_thumbnail_candidates(entry["thumbnails"], size):
                 print_dry(f"Would fetch artwork for: {display}")
+            elif cover_candidates:
+                print_dry(f"Would use the playlist cover for: {display}")
+            elif per_track and widest_thumbnail_url(entry["thumbnails"]):
+                print_dry(f"Would crop a square frame for: {display}")
+            else:
+                print_warn(f"No square artwork available for: {display}")
         return by_url, by_title, all_thumbnails
+
+    # Tier 2: the playlist's own cover, shared by every track. Hidden and
+    # content-addressed so a user's cover.jpg is never touched. Candidates are
+    # tried largest-first because YouTube advertises album sizes that 404.
+    # Fetched lazily: in per-track mode it is only a last resort, so eagerly
+    # downloading it would cost a request and leave an unused file behind.
+    cover_path: Path | None = None
+    cover_lock = threading.Lock()
+    cover_candidates = square_thumbnail_candidates(playlist_thumbnails, size)
+
+    def get_cover() -> Path | None:
+        nonlocal cover_path
+        if cover_path is not None or not cover_candidates:
+            return cover_path
+        with cover_lock:
+            if cover_path is not None:
+                return cover_path
+            for url in cover_candidates:
+                digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+                candidate = output_dir / f".ytm-playlist-cover_{digest}.jpg"
+                if download_image(url, candidate):
+                    cover_path = candidate
+                    all_thumbnails.add(candidate)
+                    break
+        return cover_path
+
+    if not per_track:
+        get_cover()
 
     img_url_cache: dict[str, Path] = {}
     url_locks: dict[str, threading.Lock] = {}
@@ -803,28 +1325,47 @@ def fetch_playlist_artwork(
         track_url = entry["webpage_url"]
         title     = entry["title"]
         display   = f"{entry['index']} {title}"
-        img_url   = best_square_thumbnail(entry["thumbnails"], size)
 
-        if not img_url:
-            print_warn(f"No square thumbnail for: {display}")
-            return None
+        # Tier 1 — the track's own square artwork.
+        own = square_thumbnail_candidates(entry["thumbnails"], size)
+        if own:
+            lock = get_url_lock(own[0])
+            with lock:
+                cached = img_url_cache.get(own[0])
+                if cached is not None:
+                    print_art_reuse(display)
+                    return title, track_url, cached
+                digest = hashlib.sha256(own[0].encode("utf-8")).hexdigest()[:10]
+                safe = re.sub(r'[^\w\s-]', '', title)[:32].strip()
+                thumb_path = output_dir / f"thumb_{digest}_{safe}.jpg"
+                if download_first_available(own, thumb_path):
+                    img_url_cache[own[0]] = thumb_path
+                    print_art(display)
+                    return title, track_url, thumb_path
+            print_warn(f"Failed to download artwork for: {display}")
 
-        lock = get_url_lock(img_url)
-        with lock:
-            thumb_path = img_url_cache.get(img_url)
-            if thumb_path is not None:
-                print_art_reuse(display)
-                return title, track_url, thumb_path
+        # Tier 2 — the shared playlist/album cover.
+        # Tier 3 (opt-in) — a distinct square cropped from this track's own
+        # frame. Tried before the shared cover because that is the whole point
+        # of per_track: one cover for a mixed playlist identifies nothing.
+        if per_track:
+            frame = widest_thumbnail_url(entry["thumbnails"])
+            if frame:
+                digest = hashlib.sha256(frame.encode("utf-8")).hexdigest()[:10]
+                safe = re.sub(r'[^\w\s-]', '', title)[:32].strip()
+                thumb_path = output_dir / f"thumb_{digest}_{safe}.jpg"
+                if download_image(frame, thumb_path) and crop_to_square(
+                        thumb_path, thumb_path, size):
+                    print_art(f"{display} (cropped)")
+                    return title, track_url, thumb_path
+                thumb_path.unlink(missing_ok=True)
 
-            safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip()
-            thumb_path = output_dir / f"thumb_{safe_title}.jpg"
-            if download_image(img_url, thumb_path):
-                img_url_cache[img_url] = thumb_path
-                print_art(display)
-                return title, track_url, thumb_path
-            else:
-                print_warn(f"Failed to download artwork for: {display}")
-                return None
+        if cover_path is not None or get_cover() is not None:
+            print_art_reuse(f"{display} (playlist cover)")
+            return title, track_url, cover_path
+
+        print_warn(f"No square artwork available for: {display}")
+        return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_entry, entry) for entry in entries]
@@ -838,7 +1379,11 @@ def fetch_playlist_artwork(
                 by_url[track_url] = thumb_path
             by_title[title] = thumb_path
 
-    print_success(f"Fetched {len(img_url_cache)} unique artwork image(s).")
+    unique = len(img_url_cache) + (1 if cover_path is not None else 0)
+    summary = f"Fetched {unique} unique artwork image(s)"
+    if cover_path is not None and not img_url_cache:
+        summary += " (playlist cover shared by all tracks)"
+    print_success(summary + ".")
     return by_url, by_title, all_thumbnails
 
 
@@ -852,7 +1397,6 @@ def run_download_pass(
     codec:           str,
     container:       str,
     final_ext:       str,
-    skip_artwork:    bool,
     retries:         int,
     dry_run:         bool,
     album:           bool,
@@ -863,6 +1407,7 @@ def run_download_pass(
     browser:         str,
     logger:          logging.Logger,
     label:           str = "",
+    per_track:       bool = False,
 ):
     prefix = f"{label} " if label else ""
 
@@ -870,6 +1415,15 @@ def run_download_pass(
     by_url:         dict[str, Path] = {}
     by_title:       dict[str, Path] = {}
     all_thumbnails: set[Path]       = set()
+
+    backend = ARTWORK_BACKEND.get(final_ext, "skip")
+    if backend == "mutagen" and not HAVE_MUTAGEN:
+        backend = "skip"
+        print_warn(
+            f"{prefix}mutagen is not installed (pip install mutagen) — "
+            f"skipping artwork for {container} files."
+        )
+    skip_artwork = (backend == "skip")
 
     if skip_artwork:
         print_warn(
@@ -880,8 +1434,13 @@ def run_download_pass(
         cover_path = fetch_album_artwork(url, size, dry_run, output_dir, browser)
     else:
         by_url, by_title, all_thumbnails = fetch_playlist_artwork(
-            url, size, dry_run, track_selection, output_dir, browser, max_workers
+            url, size, dry_run, track_selection, output_dir, browser, max_workers,
+            per_track=per_track,
         )
+
+    # Record the scratch files now that they exist, so a Ctrl+C anywhere below
+    # (download, probing, muxing) still removes them from the music folder.
+    _register_artwork(album, cover_path, all_thumbnails)
 
     existing_files = {
         f.resolve() for f in output_dir.glob(f"*.{final_ext}")
@@ -908,11 +1467,31 @@ def run_download_pass(
 
     cleanup_yt_dlp_temps(output_dir, final_ext)
 
+    # Safety net for a mis-predicted extension (e.g. an exotic --format):
+    # adopt whatever actually landed rather than reporting an empty result.
+    if not any(output_dir.glob(f"*.{final_ext}")):
+        detected = next(
+            (ext for ext in AUDIO_EXTS if any(output_dir.glob(f"*.{ext}"))), None
+        )
+        if detected and detected != final_ext:
+            print_warn(
+                f"{prefix}Expected '.{final_ext}' but found '.{detected}' — "
+                f"using '.{detected}' for this run."
+            )
+            final_ext  = detected
+            container  = {v: k for k, v in CONTAINER_EXT.items()}.get(detected, container)
+            backend    = ARTWORK_BACKEND.get(detected, "skip")
+            if backend == "mutagen" and not HAVE_MUTAGEN:
+                backend = "skip"
+            skip_artwork = (backend == "skip")
+            cleanup_yt_dlp_temps(output_dir, final_ext)
+
     if skip_artwork:
         count = len(list(output_dir.glob(f"*.{final_ext}")))
         msg = f"{prefix}Done. {count} file(s) downloaded (artwork skipped for {container})."
         print_info(msg)
         logger.info(msg)
+        _cleanup(album, cover_path, all_thumbnails)
         return
 
     all_files = sorted(
@@ -944,7 +1523,7 @@ def run_download_pass(
     muxed   = 0
     skipped = 0
 
-    for i, audio_file in enumerate(files_to_mux, start=1):
+    for audio_file in files_to_mux:
         if album:
             thumb = cover_path
         else:
@@ -971,12 +1550,12 @@ def run_download_pass(
             skipped += 1
             continue
 
-        if mux_artwork(audio_file, thumb, i, final_ext):
+        if embed_artwork(audio_file, thumb, backend, final_ext):
             print_ok(audio_file.name)
             logger.info("%sOK    %s", prefix, audio_file.name)
             muxed += 1
         else:
-            print_fail(f"ffmpeg error on: {audio_file.name}")
+            print_fail(f"Artwork embed failed: {audio_file.name}")
             logger.error("%sFAIL  %s", prefix, audio_file.name)
             skipped += 1
 
@@ -1020,8 +1599,31 @@ def main():
     max_workers     = resolved(global_ns.max_workers, "artwork",  "max_workers",     8)
     log_setting     = resolved(global_ns.log,         "behavior", "log",             "off")
 
+    # None-able store_true so the config file can supply the default.
+    if global_ns.per_track_art is not None:
+        per_track = global_ns.per_track_art
+    else:
+        per_track = bool(cfg_get(config, "artwork", "per_track", False))
+
     if browser.lower() not in KNOWN_BROWSERS:
         print_warn(f"'{browser}' is not a browser ytm-dlp recognizes — passing it through to yt-dlp as-is.")
+
+    # Config values arrive unvalidated, and a bad value used to surface as an
+    # unhandled traceback (max_workers=0, or a non-numeric size from the TOML).
+    def positive_int(value, name, default, minimum=1):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            print_warn(f"Invalid {name}={value!r} in config — using {default}.")
+            return default
+        if number < minimum:
+            print_warn(f"{name} must be >= {minimum} (got {number}) — using {default}.")
+            return default
+        return number
+
+    retries     = positive_int(retries,     "retries",     10, 0)
+    size        = positive_int(size,        "size",        600, 64)
+    max_workers = positive_int(max_workers, "max_workers", 8)
 
     fmt, codec, container, final_ext, skip_artwork = resolve_download_profile(
         codec_setting, quality, container_o, format_override
@@ -1030,11 +1632,13 @@ def main():
               ("  — artwork embedding will be skipped" if skip_artwork else ""))
 
     log_path: Path | None = None
-    if log_setting and str(log_setting).lower() not in ("off", ""):
+    log_value = str(log_setting).strip().lower() if log_setting else "off"
+    if log_value not in ("off", ""):
         log_path = Path(
             f"ytm-dlp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-            if log_setting == "auto" else str(log_setting)
+            if log_value == "auto" else str(log_setting)
         )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logging(log_path)
 
@@ -1042,59 +1646,70 @@ def main():
         sys.exit(0)
 
     total_jobs = len(jobs)
-    for job_idx, job in enumerate(jobs, start=1):
-        album    = is_album_url(job.url)
-        base_dir = job.resolved_dir or Path.cwd()
+    try:
+        for job_idx, job in enumerate(jobs, start=1):
+            album    = is_album_url(job.url)
+            base_dir = job.resolved_dir or Path.cwd()
 
-        if total_jobs > 1:
-            print_header(f"Job {job_idx}/{total_jobs}  —  {job.url}")
+            if total_jobs > 1:
+                print_header(f"Job {job_idx}/{total_jobs}  —  {job.url}")
 
-        if job.cd_specs:
-            print_info(f"Multi-disc mode: {len(job.cd_specs)} disc(s).")
-            for folder_name, disc_tracks in job.cd_specs:
-                sanitized_name = sanitize_folder_name(folder_name)
-                if sanitized_name != folder_name:
-                    print_warn(
-                        f"Disc folder name contained illegal characters and "
-                        f"was adjusted: '{folder_name}' → '{sanitized_name}'"
+            if job.cd_specs:
+                print_info(f"Multi-disc mode: {len(job.cd_specs)} disc(s).")
+                for folder_name, disc_tracks in job.cd_specs:
+                    sanitized_name = sanitize_folder_name(folder_name)
+                    if sanitized_name != folder_name:
+                        print_warn(
+                            f"Disc folder name contained illegal characters and "
+                            f"was adjusted: '{folder_name}' → '{sanitized_name}'"
+                        )
+                    folder_name = sanitized_name or folder_name
+
+                    print_header(f"Disc: {folder_name}  |  Tracks: {sorted(disc_tracks)}")
+                    disc_dir = base_dir / folder_name
+                    if not disc_dir.exists():
+                        if global_ns.dry_run:
+                            print_dry(f"Would create disc folder: {disc_dir}")
+                        else:
+                            disc_dir.mkdir(parents=False, exist_ok=True)
+                            print_success(f"Created disc folder: {disc_dir}")
+
+                    run_download_pass(
+                        url=job.url, fmt=fmt, codec=codec, container=container,
+                        final_ext=final_ext,
+                        retries=retries, dry_run=global_ns.dry_run,
+                        album=album, size=size, max_workers=max_workers,
+                        track_selection=disc_tracks,
+                        output_dir=disc_dir,
+                        browser=browser,
+                        logger=logger,
+                        label=f"[{folder_name}]",
+                        per_track=per_track,
                     )
-                folder_name = sanitized_name or folder_name
 
-                print_header(f"Disc: {folder_name}  |  Tracks: {sorted(disc_tracks)}")
-                disc_dir = base_dir / folder_name
-                if not disc_dir.exists():
-                    if global_ns.dry_run:
-                        print_dry(f"Would create disc folder: {disc_dir}")
-                    else:
-                        disc_dir.mkdir(parents=False, exist_ok=True)
-                        print_success(f"Created disc folder: {disc_dir}")
+            else:
+                if job.track_selection:
+                    print_info(f"Track selection: {sorted(job.track_selection)}")
 
                 run_download_pass(
                     url=job.url, fmt=fmt, codec=codec, container=container,
-                    final_ext=final_ext, skip_artwork=skip_artwork,
+                    final_ext=final_ext,
                     retries=retries, dry_run=global_ns.dry_run,
                     album=album, size=size, max_workers=max_workers,
-                    track_selection=disc_tracks,
-                    output_dir=disc_dir,
+                    track_selection=job.track_selection,
+                    output_dir=base_dir,
                     browser=browser,
                     logger=logger,
-                    label=f"[{folder_name}]",
+                    per_track=per_track,
                 )
-
-        else:
-            if job.track_selection:
-                print_info(f"Track selection: {sorted(job.track_selection)}")
-
-            run_download_pass(
-                url=job.url, fmt=fmt, codec=codec, container=container,
-                final_ext=final_ext, skip_artwork=skip_artwork,
-                retries=retries, dry_run=global_ns.dry_run,
-                album=album, size=size, max_workers=max_workers,
-                track_selection=job.track_selection,
-                output_dir=base_dir,
-                browser=browser,
-                logger=logger,
-            )
+    except KeyboardInterrupt:
+        # 130 is the conventional exit code for SIGINT, and the scratch files
+        # this script creates must not be left behind in the music folder.
+        print()
+        print_warn("Interrupted — cleaning up temporary artwork files.")
+        _cleanup_pending_artwork()
+        logger.warning("Interrupted by user")
+        sys.exit(130)
 
     if total_jobs > 1:
         print_header(f"All {total_jobs} job(s) complete.")
@@ -1104,7 +1719,29 @@ def main():
 # Cleanup
 # ---------------------------------------------------------------------------
 
+# Artwork scratch files for the pass currently in flight, so an interrupt
+# anywhere in the job loop can still remove them.
+_pending_artwork: list[tuple[bool, Path | None, set[Path]]] = []
+
+
+def _register_artwork(album: bool, cover_path: Path | None,
+                      all_thumbnails: set[Path]) -> None:
+    _pending_artwork.append((album, cover_path, all_thumbnails))
+
+
+def _cleanup_pending_artwork() -> None:
+    # Snapshot and empty the registry *before* cleaning: _cleanup() clears it
+    # itself, which would otherwise discard the still-pending entries.
+    pending, _pending_artwork[:] = list(_pending_artwork), []
+    for album, cover_path, all_thumbnails in reversed(pending):
+        try:
+            _cleanup(album, cover_path, all_thumbnails)
+        except OSError:
+            pass
+
+
 def _cleanup(album: bool, cover_path: Path | None, all_thumbnails: set[Path]):
+    _pending_artwork.clear()          # this pass is over; nothing left to guard
     if album:
         if cover_path and cover_path.exists():
             cover_path.unlink()
